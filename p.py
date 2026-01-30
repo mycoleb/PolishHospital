@@ -28,6 +28,47 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 
 from eurostat import get_data_df
+def wide_to_long_eurostat(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert eurostat wide format like:
+      geo\\TIME_PERIOD, 2014, 2015, ...
+    into long format:
+      geo, time, values
+    """
+    df = df.copy()
+
+    # Find the "geo\\TIME_PERIOD" column Eurostat sometimes uses
+    geo_time_cols = [c for c in df.columns if "\\TIME_PERIOD" in c]
+    if not geo_time_cols:
+        raise RuntimeError(f"Could not find a geo/time column in: {list(df.columns)}")
+
+    geo_time = geo_time_cols[0]
+    s = df[geo_time].astype(str)
+
+    # If values look like "PL21\\2023" split into geo + time;
+    # if values look like just "PL21", treat as geo only.
+    if s.str.contains("\\\\").any():
+        parts = s.str.split("\\\\", n=1, expand=True)
+        df["geo"] = parts[0]
+        df["_time_from_key"] = pd.to_numeric(parts[1], errors="coerce")
+    else:
+        df["geo"] = s
+        df["_time_from_key"] = pd.NA
+
+    # Identify year columns (e.g., '2014', '2015', ...)
+    year_cols = [c for c in df.columns if str(c).isdigit() and len(str(c)) == 4]
+    if not year_cols:
+        # Already long-ish; return as-is
+        return df
+
+    # Melt year columns into a single column named "time"
+    id_vars = [c for c in df.columns if c not in year_cols]
+    long_df = df.melt(id_vars=id_vars, value_vars=year_cols, var_name="time", value_name="values")
+
+    # Convert time safely (now it's guaranteed to be a single Series)
+    long_df["time"] = pd.to_numeric(long_df["time"], errors="coerce").astype("Int64")
+
+    return long_df
 
 
 GISCO_NUTS2_URL = (
@@ -109,17 +150,41 @@ def load_population_nuts2() -> pd.DataFrame:
     """
     Load population at NUTS2 level (tgs00096).
     Returns columns: geo, time, population
+    Works with both 'long' and 'wide' eurostat outputs.
     """
     df = get_data_df("tgs00096", flags=False)
-    # Expect columns: geo, time, values (sometimes 'values' or 'value')
+
+    # Convert wide -> long if needed
+    if any("\\TIME_PERIOD" in c for c in df.columns) or any(str(c).isdigit() for c in df.columns):
+        df = wide_to_long_eurostat(df)
+
+    # Some eurostat outputs already have geo/time columns
+    if "geo" not in df.columns:
+        # fallback: look for a geo-like column
+        geo_candidates = [c for c in df.columns if c.lower() == "geo"]
+        if geo_candidates:
+            df["geo"] = df[geo_candidates[0]]
+        else:
+            raise RuntimeError(f"Population: could not find 'geo' column. Columns: {list(df.columns)}")
+
+    if "time" not in df.columns:
+        # fallback: sometimes TIME_PERIOD exists
+        if "TIME_PERIOD" in df.columns:
+            df["time"] = pd.to_numeric(df["TIME_PERIOD"], errors="coerce").astype("Int64")
+        else:
+            raise RuntimeError(f"Population: could not find 'time' column. Columns: {list(df.columns)}")
+
     value_col = "values" if "values" in df.columns else ("value" if "value" in df.columns else None)
     if value_col is None:
-        raise RuntimeError(f"Unexpected tgs00096 schema: {list(df.columns)}")
+        raise RuntimeError(f"Population: missing values column. Columns: {list(df.columns)}")
 
     df = df.rename(columns={value_col: "population"})
-    df = df[df["geo"].astype(str).str.startswith("PL")].copy()
+
     df["population"] = pd.to_numeric(df["population"], errors="coerce")
-    df = df.dropna(subset=["population"])
+    df = df.dropna(subset=["population", "time"])
+    df = df[df["geo"].astype(str).str.startswith("PL")].copy()
+
+    # Keep just what we need
     return df[["geo", "time", "population"]]
 
 
@@ -127,25 +192,35 @@ def load_hospital_beds_nuts2() -> pd.DataFrame:
     """
     Load available beds in hospitals at NUTS2 (hlth_rs_bdsrg2).
     Returns columns: geo, time, beds
+    Works with both 'long' and 'wide' eurostat outputs.
     """
     df = get_data_df("hlth_rs_bdsrg2", flags=False)
 
+    # Convert wide -> long if needed
+    if any("\\TIME_PERIOD" in c for c in df.columns) or any(str(c).isdigit() for c in df.columns):
+        df = wide_to_long_eurostat(df)
+
+    if "geo" not in df.columns:
+        raise RuntimeError(f"Beds: could not find 'geo' column. Columns: {list(df.columns)}")
+
+    if "time" not in df.columns:
+        if "TIME_PERIOD" in df.columns:
+            df["time"] = pd.to_numeric(df["TIME_PERIOD"], errors="coerce").astype("Int64")
+        else:
+            raise RuntimeError(f"Beds: could not find 'time' column. Columns: {list(df.columns)}")
+
     value_col = "values" if "values" in df.columns else ("value" if "value" in df.columns else None)
     if value_col is None:
-        raise RuntimeError(f"Unexpected hlth_rs_bdsrg2 schema: {list(df.columns)}")
+        raise RuntimeError(f"Beds: missing values column. Columns: {list(df.columns)}")
 
     df = df.rename(columns={value_col: "beds"})
 
-    # Filter to Poland regions
-    df = df[df["geo"].astype(str).str.startswith("PL")].copy()
     df["beds"] = pd.to_numeric(df["beds"], errors="coerce")
-    df = df.dropna(subset=["beds"])
+    df = df.dropna(subset=["beds", "time"])
+    df = df[df["geo"].astype(str).str.startswith("PL")].copy()
 
-    # hlth_rs_bdsrg2 can contain multiple dimensions (e.g., care type / unit).
-    # Keep "Total" / "All" where possible by preferring rows with minimal extra dimensions.
-    # A simple robust approach: if multiple rows exist per (geo,time), take the max (often Total).
+    # Dataset can have extra dims; take max per (geo,time) as a robust "total" approximation
     grp = df.groupby(["geo", "time"], as_index=False)["beds"].max()
-
     return grp
 
 
